@@ -10,6 +10,8 @@ install.packages('xml2')
 install.packages('devtools')
 install.packages('jsonlite')
 install.packages('rlist')
+install.packages('doSNOW')
+install.packages('foreach')
 
 
 ## 패키지 로딩
@@ -18,10 +20,8 @@ library(devtools)
 library(tidyverse) # metapackage with lots of helpful functions
 library(jsonlite)
 library(rlist)
-
-#for fast EDA
-library(DataExplorer) 
-library(ggthemes)
+library(doSNOW)
+library(foreach) 
 
 ## 데이터 로딩
 train <- read_csv('~/R/data/train.csv')
@@ -31,54 +31,56 @@ test <- read_csv('~/R/data/test.csv')
 str(train)
 str(test)
 
-#Courtesy: https://www.kaggle.com/mrlong/r-flatten-json-columns
-#Courtesy: https://www.kaggle.com/mrlong/r-flatten-json-columns#387132
+## https://www.kaggle.com/mrlong/r-flatten-json-columns-to-make-single-data-frame
 
-jsontodf <- function(col){
-  list.stack(lapply(col, function(j){
-    as.list(unlist(fromJSON(j)))}) , fill=TRUE)   
+jsontodf <- function(col) {
+  cores <- 4
+  cl<-makeCluster(cores)
+  registerDoSNOW(cl)
+  nr <- length(col)
+  chunk <- floor(nr/cores)
+  s <- rep(1:cores, each = chunk)
+  s <- c(s, rep(cores,nr-length(s)))
+  for(i in 1:cores) {
+    col.core <- col[s==i]
+    clusterExport(cl[i], 'col.core', envir = environment())
+  }
+  col.df <- foreach(i=1:cores, .combine = 'bind_rows', .noexport = 'col.core', .packages = c('jsonlite', 'rlist', 'magrittr')) %dopar% {
+    paste("[", paste(col.core, collapse = ","), "]") %>% fromJSON(flatten = TRUE)
+  }
+  stopCluster(cl)
+  return(as.data.frame(col.df))
 }
 
+## 데이터 변환
+# train data
+train$date <- as.character(train$date)
+train$visitId <- as.character(train$visitId)
 
-
-#Convert each JSON column in the train and test sets
 tr_device <- jsontodf(train$device)
 tr_geoNetwork <- jsontodf(train$geoNetwork)
 tr_totals <- jsontodf(train$totals)
 tr_trafficSource <- jsontodf(train$trafficSource)
+
+train <- select(train, -c('device', 'geoNetwork', 'totals', 'trafficSource'))
+train <- bind_cols(train, tr_device, tr_geoNetwork, tr_totals, tr_trafficSource)
+
+# test data
+test$date <- as.character(test$date)
+test$visitId <- as.character(test$visitId)
 
 te_device <- jsontodf(test$device)
 te_geoNetwork <- jsontodf(test$geoNetwork)
 te_totals <- jsontodf(test$totals)
 te_trafficSource <- jsontodf(test$trafficSource)
 
+test <- select(test, -c('device', 'geoNetwork', 'totals', 'trafficSource'))
+test <- bind_cols(test, te_device, te_geoNetwork, te_totals, te_trafficSource)
 
-#Check to see if the training and test sets have the same column names
-setequal(names(tr_device), names(te_device))
-setequal(names(tr_geoNetwork), names(te_geoNetwork))
-setequal(names(tr_totals), names(te_totals))
-setequal(names(tr_trafficSource), names(te_trafficSource))
+## rm(te_device, te_geoNetwork, te_totals, te_trafficSource)
 
-#As expected, all are equal except for the totals - which includes the target, transactionRevenue
-#Clearly this should only appear in the training set
-names(tr_totals)
-names(te_totals)
-#transactionRevenue is the only different column here
+colnames(train)[!colnames(train) %in% colnames(test)]
 
-
-#Combine to make the full training and test sets
-train <- train %>%
-  cbind(tr_device, tr_geoNetwork, tr_totals, tr_trafficSource) %>%
-  select(-device, -geoNetwork, -totals, -trafficSource)
-
-test <- test %>%
-  cbind(te_device, te_geoNetwork, te_totals, te_trafficSource) %>%
-  select(-device, -geoNetwork, -totals, -trafficSource)
-
-
-
-
-
-
-
-
+## 분석용 데이터 저장
+write_csv(train, '~/R/data/train_mart.csv')
+write_csv(test, '~/R/data/test_mart.csv')
